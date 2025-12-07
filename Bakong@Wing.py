@@ -79,7 +79,7 @@ def check_payment_status(bill_number, md5_hash, chat_id, message_id):
                 f"🎉 **បានទូទាត់រួចរាល់ហើយ! (Payment Completed)**\n"
                 f"លេខបង្កាន់ដៃ: `{bill_number}`\n"
                 f"ស្ថានភាព: **{payment_status}**\n"
-                f"សូមអរrគុណសម្រាប់ការទូទាត់!", 
+                f"សូមអរគុណសម្រាប់ការទូទាត់!", 
                 parse_mode="Markdown"
             )
             
