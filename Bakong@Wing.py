@@ -238,7 +238,7 @@ def generate_khqr_payment(message):
         keyboard = types.InlineKeyboardMarkup()
         # The callback_data includes the transaction bill_number
         callback_data = f"{CONFIRM_CALLBACK_PREFIX}{bill_number}"
-        confirm_button = types.InlineKeyboardButton("✅ ពិនិត្យការទូទាត់ (Confirm Payment)", callback_data=callback_data)
+        confirm_button = types.InlineKeyboardButton("✅ Confirm Payment", callback_data=callback_data)
         keyboard.add(confirm_button)
 
         # 7. Send the QR code image and instructions
