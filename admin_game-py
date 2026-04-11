@@ -1,1 +1,2121 @@
-1
+import html
+import logging
+import os
+import sqlite3
+import threading
+import time
+from datetime import datetime
+from io import BytesIO
+
+import qrcode
+import requests
+from telebot import TeleBot
+from telebot.types import (
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+)
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
+
+if load_dotenv:
+    load_dotenv()
+
+# ═══════════════════════════════════════════════════
+#  Environment Helpers
+# ═══════════════════════════════════════════════════
+
+def _get_env(name, *, default=None, required=False):
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        if required:
+            raise RuntimeError(f"Missing required environment variable: {name}")
+        return default
+    return value.strip()
+
+
+def _get_env_int(name, *, default=None, required=False):
+    raw = _get_env(name, default=None, required=required)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError(f"Environment variable {name} must be an integer") from exc
+
+
+def _get_env_int_list(name, *, default=None):
+    raw = _get_env(name)
+    if raw is None:
+        return default or []
+    result = []
+    for chunk in raw.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        try:
+            result.append(int(chunk))
+        except ValueError as exc:
+            raise ValueError(f"{name} must contain integers separated by commas") from exc
+    return result
+
+
+# ═══════════════════════════════════════════════════
+#  Configuration
+# ═══════════════════════════════════════════════════
+
+BOT_TOKEN = _get_env("8660828387:AAGXON_MIFfOz4qIRtulcv_gEXjXQy3Mkck", required=True)
+KHPAY_API_KEY = _get_env("KHPAY_API_KEY", required=True)
+KHPAY_BASE_URL = _get_env("KHPAY_BASE_URL", default="https://khpay.site/api/v1")
+
+ADMIN_IDS = _get_env_int_list("ADMIN_IDS")
+if not ADMIN_IDS:
+    raise RuntimeError("ADMIN_IDS must contain at least one Telegram user ID")
+
+DEPOSIT_GROUP_ID = _get_env_int("DEPOSIT_GROUP_ID", required=True)
+GROUP_OPERATIONS_ID = _get_env_int("GROUP_OPERATIONS_ID")
+GROUP_FF_ID = _get_env_int("GROUP_FF_ID")
+GROUP_MLBB_ID = _get_env_int("GROUP_MLBB_ID")
+
+logging.basicConfig(level=logging.INFO)
+bot = TeleBot(BOT_TOKEN)
+
+
+# ═══════════════════════════════════════════════════
+#  Premium Custom Emoji
+# ═══════════════════════════════════════════════════
+# Set True when your bot has purchased custom emoji support via @BotFather / Fragment.
+# When False, plain unicode emoji are used instead (always works).
+USE_CUSTOM_EMOJI = False
+
+# name -> (unicode_fallback, custom_emoji_id)
+# Replace the IDs with valid custom emoji IDs from your sticker packs.
+CUSTOM_EMOJI = {
+    "star":   ("⭐", "5368324170671202286"),
+    "fire":   ("🔥", "5404835018822498347"),
+    "check":  ("✅", "5368324170671202286"),
+    "money":  ("💰", "5373141891321699086"),
+    "shop":   ("🛒", "5368324170671202286"),
+    "game":   ("🎮", "5368391665089998543"),
+    "wave":   ("👋", "5368324170671202286"),
+    "spark":  ("✨", "5368324170671202286"),
+    "lock":   ("🔐", "5368324170671202286"),
+}
+
+
+def _e(name):
+    """Return &lt;tg-emoji&gt; tag if premium enabled, else fallback unicode."""
+    fallback, eid = CUSTOM_EMOJI.get(name, ("❓", ""))
+    if USE_CUSTOM_EMOJI and eid:
+        return f'<tg-emoji emoji-id="{eid}">{fallback}</tg-emoji>'
+    return fallback
+
+
+def _h(text):
+    """HTML-escape user-provided text to prevent injection."""
+    return html.escape(str(text))
+
+
+# ═══════════════════════════════════════════════════
+#  KHPay Client
+# ═══════════════════════════════════════════════════
+
+class KHPayClient:
+    def __init__(self, api_key, base_url):
+        self.base_url = base_url.rstrip("/")
+        self.session = requests.Session()
+        self.session.headers.update({
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        })
+
+    def generate_qr(self, amount, currency="USD", note=""):
+        resp = self.session.post(
+            f"{self.base_url}/qr/generate",
+            json={"amount": str(amount), "currency": currency, "note": note},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if not data.get("success") or "data" not in data:
+            raise RuntimeError(f"KHPay error: {data}")
+        return data["data"]
+
+    def check_payment(self, transaction_id):
+        resp = self.session.get(
+            f"{self.base_url}/qr/check/{transaction_id}",
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return resp.json().get("data", {})
+
+    def expire_transaction(self, transaction_id):
+        resp = self.session.post(
+            f"{self.base_url}/qr/expire/{transaction_id}",
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
+khpay = KHPayClient(KHPAY_API_KEY, KHPAY_BASE_URL)
+
+user_states = {}
+active_deposits = {}  # uid -> True while deposit polling is running
+
+
+# ═══════════════════════════════════════════════════
+#  Product Prices
+# ═══════════════════════════════════════════════════
+
+ITEM_PRICES = {
+    "11":       {"normal": 0.25, "reseller": 0.22},
+    "22":       {"normal": 0.50, "reseller": 0.44},
+    "86":       {"normal": 1.25, "reseller": 1.15},
+    "172":      {"normal": 2.45, "reseller": 2.25},
+    "257":      {"normal": 3.50, "reseller": 3.20},
+    "343":      {"normal": 4.63, "reseller": 3.33},
+    "429":      {"normal": 5.70, "reseller": 5.43},
+    "514":      {"normal": 6.80, "reseller": 6.42},
+    "600":      {"normal": 7.90, "reseller": 7.53},
+    "706":      {"normal": 9.10, "reseller": 8.61},
+    "792":      {"normal": 9.95, "reseller": 9.65},
+    "878":      {"normal": 12.10, "reseller": 10.38},
+    "963":      {"normal": 12.10, "reseller": 11.55},
+    "1050":     {"normal": 13.40, "reseller": 12.80},
+    "1135":     {"normal": 14.42, "reseller": 13.75},
+    "1412":     {"normal": 17.80, "reseller": 16.75},
+    "1584":     {"normal": 19.99, "reseller": 18.99},
+    "1755":     {"normal": 23.28, "reseller": 21.28},
+    "1926":     {"normal": 24.89, "reseller": 22.89},
+    "2195":     {"normal": 27.37, "reseller": 25.32},
+    "2538":     {"normal": 31.60, "reseller": 29.35},
+    "2901":     {"normal": 35.72, "reseller": 33.55},
+    "4394":     {"normal": 52.80, "reseller": 50.60},
+    "5532":     {"normal": 65.80, "reseller": 63.60},
+    "6238":     {"normal": 77.15, "reseller": 71.90},
+    "6944":     {"normal": 85.50, "reseller": 79.83},
+    "9288":     {"normal": 116.00, "reseller": 113.00},
+    "Weekly":   {"normal": 1.40, "reseller": 1.37},
+    "2Weekly":  {"normal": 2.80, "reseller": 2.70},
+    "3Weekly":  {"normal": 4.20, "reseller": 4.10},
+    "4Weekly":  {"normal": 5.60, "reseller": 5.40},
+    "5Weekly":  {"normal": 7.00, "reseller": 6.20},
+    "Twilight": {"normal": 7.35, "reseller": 6.85},
+    "50x2":    {"normal": 0.90, "reseller": 0.80},
+    "150x2":   {"normal": 2.40, "reseller": 2.20},
+    "250x2":   {"normal": 3.85, "reseller": 3.55},
+    "500x2":   {"normal": 7.19, "reseller": 6.90},
+}
+
+ITEM_FF_PRICES = {
+    "25":          {"normal": 0.28, "reseller": 0.25},
+    "100":         {"normal": 0.90, "reseller": 0.85},
+    "310":         {"normal": 2.65, "reseller": 2.55},
+    "520":         {"normal": 4.25, "reseller": 4.10},
+    "1060":        {"normal": 8.65, "reseller": 8.25},
+    "2180":        {"normal": 16.50, "reseller": 16.15},
+    "5600":        {"normal": 43.00, "reseller": 41.00},
+    "11500":       {"normal": 85.00, "reseller": 82.00},
+    "Weekly":      {"normal": 1.50, "reseller": 1.45},
+    "WeeklyLite":  {"normal": 0.40, "reseller": 0.35},
+    "Monthly":     {"normal": 7.00, "reseller": 6.72},
+    "Evo3D":       {"normal": 0.60, "reseller": 0.56},
+    "Evo7D":       {"normal": 0.90, "reseller": 0.82},
+    "Evo30D":      {"normal": 2.45, "reseller": 2.33},
+    "Levelpass":   {"normal": 3.45, "reseller": 3.30},
+}
+
+ITEM_MLPH_PRICES = {
+    "11":       {"normal": 0.28, "reseller": 0.25},
+    "22":       {"normal": 0.55, "reseller": 0.48},
+    "86":       {"normal": 1.30, "reseller": 1.20},
+    "172":      {"normal": 2.55, "reseller": 2.35},
+    "257":      {"normal": 3.60, "reseller": 3.30},
+    "343":      {"normal": 4.75, "reseller": 4.45},
+    "429":      {"normal": 5.85, "reseller": 5.55},
+    "514":      {"normal": 6.95, "reseller": 6.55},
+    "600":      {"normal": 8.10, "reseller": 7.70},
+    "Weekly":   {"normal": 1.50, "reseller": 1.45},
+    "2Weekly":  {"normal": 2.95, "reseller": 2.85},
+}
+
+GAME_MAP = {
+    "ml":   {"name": "Mobile Legends", "emoji": "🎮", "prices": ITEM_PRICES},
+    "ff":   {"name": "Free Fire", "emoji": "🔥", "prices": ITEM_FF_PRICES},
+    "mlph": {"name": "Mobile Legends PH", "emoji": "📱", "prices": ITEM_MLPH_PRICES},
+}
+
+
+def _game_label(code):
+    """Button label like '🎮 Mobile Legends' for a game code."""
+    g = GAME_MAP.get(code)
+    return f"{g['emoji']} {g['name']}" if g else code
+
+
+def _game_code_from_label(label):
+    """Reverse lookup: button text → game code."""
+    for code, g in GAME_MAP.items():
+        if label == f"{g['emoji']} {g['name']}":
+            return code
+    return None
+
+
+# ═══════════════════════════════════════════════════
+#  Database
+# ═══════════════════════════════════════════════════
+
+DB_PATH = "user_balances.db"
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS balances (
+            user_id INTEGER PRIMARY KEY,
+            balance REAL NOT NULL DEFAULT 0,
+            is_reseller INTEGER DEFAULT 0
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            game TEXT NOT NULL,
+            player_id TEXT NOT NULL,
+            server_id TEXT NOT NULL,
+            nickname TEXT,
+            item TEXT NOT NULL,
+            price REAL NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def _db_conn():
+    return sqlite3.connect(DB_PATH)
+
+
+def get_user_balance(user_id):
+    conn = _db_conn()
+    c = conn.cursor()
+    c.execute("SELECT balance FROM balances WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else 0.0
+
+
+def update_user_balance(user_id, amount):
+    conn = _db_conn()
+    c = conn.cursor()
+    c.execute("SELECT balance, is_reseller FROM balances WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    if row:
+        new_balance = row[0] + amount
+        c.execute("UPDATE balances SET balance = ? WHERE user_id = ?", (new_balance, user_id))
+    else:
+        c.execute("INSERT INTO balances (user_id, balance, is_reseller) VALUES (?, ?, 0)", (user_id, amount))
+    conn.commit()
+    conn.close()
+
+
+def is_reseller(user_id):
+    conn = _db_conn()
+    c = conn.cursor()
+    c.execute("SELECT is_reseller FROM balances WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] == 1 if row else False
+
+
+def add_reseller(user_id):
+    conn = _db_conn()
+    c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO balances (user_id, balance, is_reseller) VALUES (?, 0, 0)", (user_id,))
+    c.execute("UPDATE balances SET is_reseller = 1 WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+
+def remove_reseller(user_id):
+    conn = _db_conn()
+    c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO balances (user_id, balance, is_reseller) VALUES (?, 0, 0)", (user_id,))
+    c.execute("UPDATE balances SET is_reseller = 0 WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+
+def save_order(user_id, game, player_id, server_id, nickname, item, price):
+    conn = _db_conn()
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO orders (user_id, game, player_id, server_id, nickname, item, price, created_at) VALUES (?,?,?,?,?,?,?,?)",
+        (user_id, game, str(player_id), str(server_id), nickname, item, price, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_user_orders(user_id, limit=10):
+    conn = _db_conn()
+    c = conn.cursor()
+    c.execute("SELECT game, item, price, created_at FROM orders WHERE user_id = ? ORDER BY id DESC LIMIT ?", (user_id, limit))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def send_group_message(group_id, text):
+    if group_id is None:
+        return
+    try:
+        bot.send_message(group_id, text)
+    except Exception as e:
+        logging.error(f"Failed to send to group {group_id}: {e}")
+
+
+# ═══════════════════════════════════════════════════
+#  Helpers
+# ═══════════════════════════════════════════════════
+
+def _format_price_list(price_dict, price_key):
+    lines = []
+    for item_id, data in price_dict.items():
+        price = data.get(price_key, data.get("normal", 0))
+        if price <= 0:
+            continue
+        lines.append(f"  💎 <code>{item_id:<12}</code> ─ <b>${price:.2f}</b>")
+    return "\n".join(lines)
+
+
+def _main_menu_markup(user_id):
+    markup = ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
+    markup.add(
+        KeyboardButton("👤 Account / គណនី"),
+        KeyboardButton("🎮 Games / ហ្គេម"),
+        KeyboardButton("💰 Deposit / ដាក់ប្រាក់"),
+        KeyboardButton("📖 How to Buy / របៀបទិញ"),
+        KeyboardButton("📜 History / ប្រវត្តិ"),
+    )
+    return markup
+
+
+def _admin_menu_markup():
+    markup = ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
+    markup.add(
+        KeyboardButton("👥 Users / អ្នកប្រើ"),
+        KeyboardButton("💰 Balance / សមតុល្យ"),
+        KeyboardButton("🏪 Reseller"),
+        KeyboardButton("💵 Prices / តម្លៃ"),
+        KeyboardButton("🎮 Games Mgmt / ហ្គេម"),
+        KeyboardButton("📊 Stats / ស្ថិតិ"),
+        KeyboardButton("👤 Normal Mode"),
+    )
+    return markup
+
+
+def _box(title_en, title_kh=""):
+    kh = f"\n║  {title_kh}" if title_kh else ""
+    return (
+        f"╔═══════════════════════════╗\n"
+        f"║  {title_en}{kh}\n"
+        f"╚═══════════════════════════╝"
+    )
+
+
+def _sep():
+    return "━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+
+def _check_ff_id(player_id):
+    """Check Free Fire player ID via api.gameskinbo.com. Returns nickname or None."""
+    uid = str(player_id)
+    api_key = os.getenv("GAMESKINBO_API_KEY", "")
+    if not api_key:
+        logging.warning("GAMESKINBO_API_KEY not set — FF ID cannot be verified")
+        return None
+    try:
+        resp = requests.get(
+            "https://api.gameskinbo.com/ff-info/get",
+            params={"uid": uid},
+            headers={"x-api-key": api_key},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("error"):
+            return None
+        acct = data.get("AccountInfo", {})
+        name = acct.get("AccountName")
+        if name:
+            return name
+    except requests.RequestException as e:
+        logging.error(f"FF ID check failed: {e}")
+    return None
+
+
+def _check_mlbb_id(server_id, zone_id):
+    """Check MLBB player ID. Returns nickname or None."""
+    try:
+        resp = requests.get(
+            f"https://api.isan.eu.org/nickname/ml?id={server_id}&zone={zone_id}",
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("success"):
+            return data.get("name", "Unknown")
+    except requests.RequestException as e:
+        logging.error(f"MLBB ID check failed: {e}")
+    return None
+
+
+# ═══════════════════════════════════════════════════
+#  Admin Commands
+# ═══════════════════════════════════════════════════
+
+@bot.message_handler(commands=["start"])
+def send_welcome(message):
+    uid = message.from_user.id
+    nickname = _h(message.from_user.first_name or "User")
+
+    # Clear any pending state
+    user_states.pop(uid, None)
+
+    if uid in ADMIN_IDS:
+        text = (
+            f"{_box(_e('lock') + ' ADMIN PANEL', 'ផ្ទាំងគ្រប់គ្រង')}\n\n"
+            f"{_e('wave')} Welcome, <b>{nickname}</b>!\n"
+            f"🆔 ID: <code>{uid}</code>\n\n"
+            f"{_sep()}\n"
+            f"🔽 <b>Select option / ជ្រើសរើស:</b>"
+        )
+        markup = _admin_menu_markup()
+    else:
+        text = (
+            f"{_box(_e('shop') + ' WELCOME / សូមស្វាគមន៍')}\n\n"
+            f"{_e('wave')} សួស្ដី <b>{nickname}</b>! Welcome!\n\n"
+            f"{_e('check')} សុវត្ថិភាពជូនអតិថិជន  •  <i>Safe &amp; Secure</i>\n"
+            f"{_e('check')} តម្លៃសមរម្យ  •  <i>Affordable prices</i>\n"
+            f"{_e('check')} មិនមានការបែនអាខោន  •  <i>No bans</i>\n"
+            f"{_e('check')} ដាក់បានលឿនរហ័សទាន់ចិត្ដ  •  <i>Fast delivery</i>\n\n"
+            f"{_sep()}\n"
+            f"🔽 <b>Select option / ជ្រើសរើស:</b>"
+        )
+        markup = _main_menu_markup(uid)
+
+    try:
+        with open("logo.jpg", "rb") as photo:
+            bot.send_photo(message.chat.id, photo, caption=text, reply_markup=markup, parse_mode="HTML")
+    except FileNotFoundError:
+        bot.send_message(message.chat.id, text, reply_markup=markup, parse_mode="HTML")
+
+
+@bot.message_handler(commands=["help"])
+def help_handler(message):
+    uid = message.from_user.id
+    text = (
+        f"{_box('📚 HELP / ជំនួយ')}\n\n"
+        "<b>User Commands / ពាក្យបញ្ជាអ្នកប្រើ:</b>\n"
+        "  /start  ─  Main menu / បង្ហាញម៉ឺនុយ\n"
+        "  /help   ─  This help / ជំនួយនេះ\n\n"
+        f"{_sep()}\n"
+        "<b>Order Format / ទម្រង់បញ្ជា:</b>\n"
+        "  <code>PlayerID ServerID Item</code>\n\n"
+        "🎮 <b>MLBB:</b>  <code>123456789 12345 Weekly</code>\n"
+        "🔥 <b>FF:</b>    <code>123456789 0 Weekly</code>\n"
+    )
+    if uid in ADMIN_IDS:
+        text += (
+            f"\n{_sep()}\n"
+            "<b>Admin Commands / ពាក្យបញ្ជា Admin:</b>\n"
+            "  /addb <code>&lt;uid&gt; &lt;amount&gt;</code>  ─  Add balance\n"
+            "  /removeb <code>&lt;uid&gt; &lt;amount&gt;</code>  ─  Remove balance\n"
+            "  /addre <code>&lt;uid&gt;</code>  ─  Add reseller\n"
+            "  /delre <code>&lt;uid&gt;</code>  ─  Remove reseller\n"
+            "  /setprice <code>&lt;game&gt; &lt;item&gt; &lt;n&gt; &lt;r&gt;</code>  ─  Set price\n"
+            "  /addpdr <code>&lt;game&gt; &lt;id&gt; &lt;n&gt; &lt;r&gt;</code>  ─  Add product\n"
+            "  /delpdr <code>&lt;game&gt; &lt;id&gt;</code>  ─  Delete product\n"
+            "  /addpack <code>&lt;game&gt; &lt;name&gt; &lt;items&gt; &lt;n&gt; &lt;r&gt;</code>\n"
+            "  /addgame <code>&lt;code&gt; &lt;emoji&gt; &lt;name&gt;</code>  ─  Add game\n"
+            "  /delgame <code>&lt;code&gt;</code>  ─  Delete game\n"
+            "  /checkuser <code>&lt;uid&gt;</code>  ─  View user info\n"
+            "  /finduser <code>&lt;term&gt;</code>  ─  Search users\n"
+            "  /allusers  ─  List all users\n"
+            "  /allbal  ─  Export balances\n"
+        )
+    bot.send_message(message.chat.id, text, parse_mode="HTML")
+
+
+@bot.message_handler(commands=["addre"])
+def add_reseller_handler(message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    try:
+        target = int(message.text.split()[1])
+        add_reseller(target)
+        bot.reply_to(message, (
+            f"{_box('✅ RESELLER ADDED')}\n\n"
+            f"🆔 User: <code>{target}</code>\n"
+            f"🏪 Status: Reseller ✅"
+        ), parse_mode="HTML")
+    except (IndexError, ValueError):
+        bot.reply_to(message, "📋 Usage: <code>/addre &lt;user_id&gt;</code>", parse_mode="HTML")
+
+
+@bot.message_handler(commands=["delre"])
+def remove_reseller_handler(message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    try:
+        target = int(message.text.split()[1])
+        remove_reseller(target)
+        bot.reply_to(message, (
+            f"{_box('✅ RESELLER REMOVED')}\n\n"
+            f"🆔 User: <code>{target}</code>\n"
+            f"👤 Status: Normal User"
+        ), parse_mode="HTML")
+    except (IndexError, ValueError):
+        bot.reply_to(message, "📋 Usage: <code>/delre &lt;user_id&gt;</code>", parse_mode="HTML")
+
+
+def _set_price(message, price_dict):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    try:
+        args = message.text.split()
+        if len(args) != 4:
+            bot.reply_to(message, "📋 Usage: <code>/set_price &lt;item&gt; &lt;normal&gt; &lt;reseller&gt;</code>", parse_mode="HTML")
+            return
+        item_id, normal, reseller = args[1], float(args[2]), float(args[3])
+        if item_id not in price_dict:
+            bot.reply_to(message, f"❌ Item <code>{_h(item_id)}</code> not found", parse_mode="HTML")
+            return
+        price_dict[item_id]["normal"] = normal
+        price_dict[item_id]["reseller"] = reseller
+        bot.reply_to(message, (
+            f"{_box('💰 PRICE UPDATED')}\n\n"
+            f"🆔 Item: <code>{_h(item_id)}</code>\n"
+            f"👤 Normal: <code>${normal:.2f}</code>\n"
+            f"🏪 Reseller: <code>${reseller:.2f}</code>"
+        ), parse_mode="HTML")
+    except (IndexError, ValueError):
+        bot.reply_to(message, "❌ Invalid input")
+
+
+@bot.message_handler(commands=["set_ml"])
+def set_ml_handler(message):
+    _set_price(message, ITEM_PRICES)
+
+@bot.message_handler(commands=["set_ff"])
+def set_ff_handler(message):
+    _set_price(message, ITEM_FF_PRICES)
+
+@bot.message_handler(commands=["set_mlph"])
+def set_mlph_handler(message):
+    _set_price(message, ITEM_MLPH_PRICES)
+
+
+@bot.message_handler(commands=["setprice"])
+def set_price_generic(message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    try:
+        args = message.text.split()
+        if len(args) != 5:
+            codes = ", ".join(f"<code>{c}</code>" for c in GAME_MAP)
+            bot.reply_to(message, (
+                f"{_box('💰 SET PRICE')}\n\n"
+                f"📋 <code>/setprice &lt;game&gt; &lt;item&gt; &lt;normal&gt; &lt;reseller&gt;</code>\n\n"
+                f"🎮 Games: {codes}\n"
+                f"📌 Ex: <code>/setprice ml Weekly 2.50 2.30</code>"
+            ), parse_mode="HTML")
+            return
+        game = args[1].lower()
+        if game not in GAME_MAP:
+            codes = ", ".join(f"<code>{c}</code>" for c in GAME_MAP)
+            bot.reply_to(message, f"❌ Invalid game. Use: {codes}", parse_mode="HTML")
+            return
+        item_id = args[2]
+        price_dict = GAME_MAP[game]["prices"]
+        if item_id not in price_dict:
+            bot.reply_to(message, f"❌ Item <code>{_h(item_id)}</code> not found in {_h(GAME_MAP[game]['name'])}", parse_mode="HTML")
+            return
+        normal, reseller = float(args[3]), float(args[4])
+        price_dict[item_id]["normal"] = normal
+        price_dict[item_id]["reseller"] = reseller
+        bot.reply_to(message, (
+            f"{_box('💰 PRICE UPDATED')}\n\n"
+            f"🎮 Game: <b>{_h(GAME_MAP[game]['name'])}</b>\n"
+            f"🆔 Item: <code>{_h(item_id)}</code>\n"
+            f"👤 Normal: <code>${normal:.2f}</code>\n"
+            f"🏪 Reseller: <code>${reseller:.2f}</code>"
+        ), parse_mode="HTML")
+    except (IndexError, ValueError):
+        bot.reply_to(message, "❌ Invalid input")
+
+
+@bot.message_handler(commands=["addpdr"])
+def add_product_handler(message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    try:
+        args = message.text.split()
+        if len(args) != 5:
+            bot.reply_to(message, (
+                f"{_box('➕ ADD PRODUCT')}\n\n"
+                "📋 <code>/addpdr &lt;game&gt; &lt;id&gt; &lt;normal&gt; &lt;reseller&gt;</code>\n\n"
+                "🎮 Games: <code>ml</code> <code>ff</code> <code>mlph</code>\n"
+                "📌 Ex: <code>/addpdr ml 1200 15.50 14.00</code>"
+            ), parse_mode="HTML")
+            return
+        game = args[1].lower()
+        product_id = args[2]
+        normal = float(args[3])
+        reseller = float(args[4])
+        if normal <= 0 or reseller <= 0:
+            bot.reply_to(message, "❌ Prices must be &gt; 0", parse_mode="HTML")
+            return
+        if game not in GAME_MAP:
+            codes = ", ".join(f"<code>{c}</code>" for c in GAME_MAP)
+            bot.reply_to(message, f"❌ Invalid game. Use: {codes}", parse_mode="HTML")
+            return
+        game_info = GAME_MAP[game]
+        game_name, price_dict = game_info["name"], game_info["prices"]
+        price_dict[product_id] = {"normal": normal, "reseller": reseller}
+        bot.reply_to(message, (
+            f"{_box('✅ PRODUCT ADDED')}\n\n"
+            f"🎮 Game: <b>{_h(game_name)}</b>\n"
+            f"🆔 Product: <code>{_h(product_id)}</code>\n"
+            f"👤 Normal: <code>${normal:.2f}</code>\n"
+            f"🏪 Reseller: <code>${reseller:.2f}</code>"
+        ), parse_mode="HTML")
+    except (IndexError, ValueError):
+        bot.reply_to(message, "❌ Invalid input")
+
+
+@bot.message_handler(commands=["addpack"])
+def add_package_handler(message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    try:
+        cmd = message.text.replace("/addpack", "").strip()
+        if not cmd:
+            bot.reply_to(message, (
+                f"{_box('📦 ADD PACKAGE')}\n\n"
+                "📋 <code>/addpack &lt;game&gt; &lt;name&gt; &lt;items&gt; &lt;normal&gt; &lt;reseller&gt;</code>\n\n"
+                "🎮 Games: <code>ml</code> <code>ff</code> <code>mlph</code>\n"
+                "➕ Use <code>+</code> to combine items\n"
+                "📌 Ex: <code>/addpack ml starter 86+Weekly 2.50 2.30</code>"
+            ), parse_mode="HTML")
+            return
+        args = cmd.split()
+        if len(args) < 5:
+            bot.reply_to(message, "❌ Not enough arguments")
+            return
+        game = args[0].lower()
+        pkg_name = args[1]
+        items = args[2]
+        normal = float(args[3])
+        reseller = float(args[4])
+        if normal <= 0 or reseller <= 0:
+            bot.reply_to(message, "❌ Prices must be &gt; 0", parse_mode="HTML")
+            return
+        if game not in GAME_MAP:
+            codes = ", ".join(f"<code>{c}</code>" for c in GAME_MAP)
+            bot.reply_to(message, f"❌ Invalid game. Use: {codes}", parse_mode="HTML")
+            return
+        game_info = GAME_MAP[game]
+        game_name, price_dict = game_info["name"], game_info["prices"]
+        for item in items.split("+"):
+            if item not in price_dict:
+                bot.reply_to(message, f"❌ Item <code>{_h(item)}</code> not found in {_h(game_name)}", parse_mode="HTML")
+                return
+        price_dict[pkg_name] = {"normal": normal, "reseller": reseller, "package_items": items}
+        bot.reply_to(message, (
+            f"{_box('📦 PACKAGE ADDED')}\n\n"
+            f"🎮 Game: <b>{_h(game_name)}</b>\n"
+            f"📋 Name: <code>{_h(pkg_name)}</code>\n"
+            f"🎁 Items: <code>{_h(items.replace('+', ' + '))}</code>\n"
+            f"👤 Normal: <code>${normal:.2f}</code>\n"
+            f"🏪 Reseller: <code>${reseller:.2f}</code>"
+        ), parse_mode="HTML")
+    except (IndexError, ValueError) as e:
+        bot.reply_to(message, f"❌ Invalid input: {_h(e)}")
+
+
+@bot.message_handler(commands=["checkuser", "viewuser"])
+def checkuser_handler(message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    try:
+        target = int(message.text.split()[1])
+        conn = _db_conn()
+        c = conn.cursor()
+        c.execute("SELECT balance, is_reseller FROM balances WHERE user_id = ?", (target,))
+        row = c.fetchone()
+        conn.close()
+        balance, is_re = (row[0], row[1]) if row else (0.0, 0)
+        re_text = "✅ Reseller" if is_re == 1 else "👤 Normal"
+        try:
+            info = bot.get_chat(target)
+            username = f"@{_h(info.username)}" if info.username else "N/A"
+            full_name = _h(f"{info.first_name or ''} {info.last_name or ''}".strip() or "Unknown")
+        except Exception:
+            username = "🔒 Private"
+            full_name = "🔒 Private"
+        bot.reply_to(message, (
+            f"{_box('👤 USER INFO', 'ព័ត៌មានអ្នកប្រើ')}\n\n"
+            f"🆔 <b>ID:</b> <code>{target}</code>\n"
+            f"📝 <b>Name:</b> {full_name}\n"
+            f"🔗 <b>Username:</b> {username}\n"
+            f"💰 <b>Balance:</b> <code>${balance:.2f}</code>\n"
+            f"🏷️ <b>Status:</b> {re_text}\n\n"
+            f"{_sep()}"
+        ), parse_mode="HTML")
+    except (IndexError, ValueError):
+        bot.reply_to(message, "📋 Usage: <code>/checkuser &lt;user_id&gt;</code>", parse_mode="HTML")
+
+
+@bot.message_handler(commands=["allusers"])
+def allusers_handler(message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    conn = _db_conn()
+    c = conn.cursor()
+    c.execute("SELECT user_id, balance, is_reseller FROM balances ORDER BY balance DESC")
+    results = c.fetchall()
+    conn.close()
+    if not results:
+        bot.reply_to(message, "❌ No users found")
+        return
+    header = (
+        f"{_box('👥 ALL USERS', 'អ្នកប្រើទាំងអស់')}\n\n"
+        f"📊 Total: <b>{len(results)}</b>\n"
+        f"{_sep()}\n\n"
+    )
+    total_bal = 0
+    re_count = 0
+    lines = []
+    for uid, bal, is_re in results:
+        total_bal += bal
+        if is_re == 1:
+            re_count += 1
+        badge = "🏪" if is_re == 1 else "👤"
+        try:
+            info = bot.get_chat(uid)
+            uname = f"@{_h(info.username)}" if info.username else "N/A"
+        except Exception:
+            uname = "Private"
+        lines.append(f"{badge} <code>{uid}</code> │ ${bal:.2f} │ {uname}")
+    body = "\n".join(lines)
+    footer = (
+        f"\n\n{_sep()}\n"
+        f"💰 Total Balance: <code>${total_bal:.2f}</code>\n"
+        f"🏪 Resellers: {re_count} │ 👤 Normal: {len(results) - re_count}"
+    )
+    full = header + body + footer
+    if len(full) > 4000:
+        import re as _re
+        plain = _re.sub(r"<[^>]+>", "", full)
+        fname = f"users_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        with open(fname, "w", encoding="utf-8") as f:
+            f.write(plain)
+        with open(fname, "rb") as f:
+            bot.send_document(message.from_user.id, f, caption="📊 Users Database")
+        os.remove(fname)
+    else:
+        bot.reply_to(message, full, parse_mode="HTML")
+
+
+@bot.message_handler(commands=["finduser"])
+def finduser_handler(message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    try:
+        term = message.text.split()[1]
+        conn = _db_conn()
+        c = conn.cursor()
+        c.execute("SELECT user_id, balance, is_reseller FROM balances")
+        results = c.fetchall()
+        conn.close()
+        found = []
+        for uid, bal, is_re in results:
+            try:
+                info = bot.get_chat(uid)
+                uname = info.username or ""
+                fname = info.first_name or ""
+                lname = info.last_name or ""
+                if (str(uid) == term or term.lower() in uname.lower()
+                        or term.lower() in fname.lower() or term.lower() in lname.lower()):
+                    found.append((uid, bal, is_re, uname, f"{fname} {lname}".strip()))
+            except Exception:
+                if str(uid) == term:
+                    found.append((uid, bal, is_re, "Private", "Private"))
+        if not found:
+            bot.reply_to(message, f"❌ No results for <code>{_h(term)}</code>", parse_mode="HTML")
+            return
+        text = (
+            f"{_box('🔍 SEARCH RESULTS', 'លទ្ធផលស្វែងរក')}\n\n"
+            f"🔎 Search: <code>{_h(term)}</code>  │  Found: <b>{len(found)}</b>\n"
+            f"{_sep()}\n\n"
+        )
+        for uid, bal, is_re, uname, full_name in found:
+            badge = "🏪" if is_re == 1 else "👤"
+            udisp = f"@{_h(uname)}" if uname and uname != "Private" else _h(uname)
+            text += f"{badge} <b>{_h(full_name)}</b>\n   🆔 <code>{uid}</code> │ 💰 <code>${bal:.2f}</code> │ {udisp}\n\n"
+        bot.reply_to(message, text, parse_mode="HTML")
+    except (IndexError, ValueError):
+        bot.reply_to(message, "📋 Usage: <code>/finduser &lt;search&gt;</code>", parse_mode="HTML")
+
+
+@bot.message_handler(commands=["allbal"])
+def allbal_handler(message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    conn = _db_conn()
+    c = conn.cursor()
+    c.execute("SELECT user_id, balance FROM balances")
+    results = c.fetchall()
+    conn.close()
+    content = "User ID, Balance\n"
+    for uid, bal in results:
+        content += f"{uid}, {bal:.2f}\n"
+    fname = "user_balances.txt"
+    with open(fname, "w") as f:
+        f.write(content)
+    with open(fname, "rb") as f:
+        bot.send_document(message.from_user.id, f, caption="💰 Balance Export")
+    os.remove(fname)
+
+
+@bot.message_handler(commands=["addb"])
+def addb_handler(message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    try:
+        args = message.text.split()
+        if len(args) != 3:
+            bot.reply_to(message, "📋 Usage: <code>/addb &lt;user_id&gt; &lt;amount&gt;</code>", parse_mode="HTML")
+            return
+        target = int(args[1])
+        amount = float(args[2])
+        if amount <= 0:
+            bot.reply_to(message, "❌ Amount must be &gt; 0", parse_mode="HTML")
+            return
+        update_user_balance(target, amount)
+        new_bal = get_user_balance(target)
+        bot.reply_to(message, (
+            f"{_box('💰 BALANCE ADDED', 'បានបន្ថែមសមតុល្យ')}\n\n"
+            f"🆔 User: <code>{target}</code>\n"
+            f"➕ Added: <code>${amount:.2f}</code>\n"
+            f"💰 New Balance: <code>${new_bal:.2f}</code>"
+        ), parse_mode="HTML")
+    except (IndexError, ValueError):
+        bot.reply_to(message, "❌ Invalid input")
+
+
+@bot.message_handler(commands=["removeb"])
+def removeb_handler(message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    try:
+        args = message.text.split()
+        if len(args) != 3:
+            bot.reply_to(message, "📋 Usage: <code>/removeb &lt;user_id&gt; &lt;amount&gt;</code>", parse_mode="HTML")
+            return
+        target = int(args[1])
+        amount = float(args[2])
+        if amount <= 0:
+            bot.reply_to(message, "❌ Amount must be &gt; 0", parse_mode="HTML")
+            return
+        update_user_balance(target, -amount)
+        new_bal = get_user_balance(target)
+        bot.reply_to(message, (
+            f"{_box('💸 BALANCE REMOVED', 'បានដកសមតុល្យ')}\n\n"
+            f"🆔 User: <code>{target}</code>\n"
+            f"➖ Removed: <code>${amount:.2f}</code>\n"
+            f"💰 New Balance: <code>${new_bal:.2f}</code>"
+        ), parse_mode="HTML")
+    except (IndexError, ValueError):
+        bot.reply_to(message, "❌ Invalid input")
+
+
+# ═══════════════════════════════════════════════════
+#  Initialize DB
+# ═══════════════════════════════════════════════════
+init_db()
+
+
+# ═══════════════════════════════════════════════════
+#  /start & Main Menu Handlers
+# ═══════════════════════════════════════════════════
+
+@bot.message_handler(func=lambda m: m.text == "👤 Account / គណនី")
+def handle_account(message):
+    uid = message.from_user.id
+    username = _h(message.from_user.username or "N/A")
+    balance = get_user_balance(uid)
+    re_status = "🏪 Reseller" if is_reseller(uid) else "👤 Normal"
+    orders = get_user_orders(uid, 5)
+
+    text = (
+        f"{_box('👤 MY ACCOUNT', 'គណនីរបស់ខ្ញុំ')}\n\n"
+        f"📝 <b>Username:</b> @{username}\n"
+        f"🆔 <b>ID:</b> <code>{uid}</code>\n"
+        f"💰 <b>Balance:</b> <code>${balance:.2f} USD</code>\n"
+        f"🏷️ <b>Type:</b> {re_status}\n"
+    )
+
+    if orders:
+        text += f"\n{_sep()}\n📜 <b>Recent Orders:</b>\n\n"
+        for game, item, price, dt in orders:
+            text += f"  🎮 {_h(game)} │ <code>{_h(item)}</code> │ ${price:.2f} │ {_h(dt)}\n"
+
+    text += f"\n{_sep()}"
+    bot.send_message(message.chat.id, text, parse_mode="HTML")
+
+
+@bot.message_handler(func=lambda m: m.text == "🎮 Games / ហ្គេម")
+def handle_game(message):
+    markup = ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
+    for code in GAME_MAP:
+        markup.add(KeyboardButton(_game_label(code)))
+    markup.add(KeyboardButton("🔙 Back / ត្រឡប់"))
+    bot.send_message(message.chat.id, (
+        f"{_box(_e('game') + ' SELECT GAME', 'ជ្រើសរើសហ្គេម')}\n\n"
+        "🔽 Choose a game below / ជ្រើសរើសហ្គេមខាងក្រោម"
+    ), reply_markup=markup, parse_mode="HTML")
+
+
+@bot.message_handler(func=lambda m: m.text == "📖 How to Buy / របៀបទិញ")
+def handle_how_to_buy(message):
+    bot.send_message(message.chat.id, (
+        f"{_box('📖 HOW TO BUY', 'របៀបទិញ')}\n\n"
+        "<b>Step 1 │ ជំហានទី 1:</b>\n"
+        "  💰 Deposit balance / ដាក់ប្រាក់ចូល\n"
+        "  Press <code>💰 Deposit / ដាក់ប្រាក់</code>\n\n"
+        "<b>Step 2 │ ជំហានទី 2:</b>\n"
+        "  🎮 Select game / ជ្រើសរើសហ្គេម\n"
+        "  Press <code>🎮 Games / ហ្គេម</code>\n\n"
+        "<b>Step 3 │ ជំហានទី 3:</b>\n"
+        "  📝 Type order / វាយបញ្ជា\n"
+        "  Format: <code>PlayerID ServerID Item</code>\n\n"
+        f"{_sep()}\n"
+        "<b>📌 Examples:</b>\n\n"
+        "  🎮 MLBB:  <code>123456789 12345 Weekly</code>\n"
+        "  🔥 FF:    <code>123456789 0 Weekly</code>\n\n"
+        f"{_sep()}"
+    ), parse_mode="HTML")
+
+
+@bot.message_handler(func=lambda m: m.text == "📜 History / ប្រវត្តិ")
+def handle_history(message):
+    uid = message.from_user.id
+    orders = get_user_orders(uid, 15)
+
+    if not orders:
+        bot.send_message(message.chat.id, (
+            f"{_box('📜 ORDER HISTORY', 'ប្រវត្តិបញ្ជា')}\n\n"
+            "❌ No orders yet / មិនទាន់មានបញ្ជាទិញទេ\n\n"
+            f"🎮 Start ordering via <b>Games / ហ្គេម</b>"
+        ), parse_mode="HTML")
+        return
+
+    text = f"{_box('📜 ORDER HISTORY', 'ប្រវត្តិបញ្ជា')}\n\n"
+    for i, (game, item, price, dt) in enumerate(orders, 1):
+        text += f"  {i}. 🎮 <b>{_h(game)}</b> │ <code>{_h(item)}</code> │ <b>${price:.2f}</b>\n     📅 {_h(dt)}\n\n"
+    text += _sep()
+    bot.send_message(message.chat.id, text, parse_mode="HTML")
+
+
+# ═══════════════════════════════════════════════════
+#  Game Product Lists
+# ═══════════════════════════════════════════════════
+
+@bot.message_handler(func=lambda m: m.text and _game_code_from_label(m.text) is not None)
+def handle_game_select(message):
+    code = _game_code_from_label(message.text)
+    g = GAME_MAP[code]
+    uid = message.from_user.id
+    user_states[uid] = {**user_states.get(uid, {}), "selected_game": code}
+    pk = "reseller" if is_reseller(uid) else "normal"
+    tag = "  🏪" if is_reseller(uid) else ""
+    pl = _format_price_list(g["prices"], pk)
+    server_hint = "0" if code == "ff" else "ServerID"
+    bot.send_message(message.chat.id, (
+        f"{_box(g['emoji'] + ' ' + g['name'].upper() + tag)}\n\n"
+        f"{pl}\n\n"
+        f"{_sep()}\n"
+        f"📝 <b>Order:</b> <code>PlayerID {server_hint} Item</code>\n"
+        f"📌 <b>Ex:</b> <code>123456789 {server_hint} Weekly</code>"
+    ), parse_mode="HTML")
+
+
+# ═══════════════════════════════════════════════════
+#  Admin Panel Button Handlers
+# ═══════════════════════════════════════════════════
+
+@bot.message_handler(func=lambda m: m.text == "👥 Users / អ្នកប្រើ")
+def admin_user_mgmt(message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    markup = ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
+    markup.add(
+        KeyboardButton("🔍 Find User / ស្វែងរក"),
+        KeyboardButton("👁️ View User / មើល"),
+        KeyboardButton("📋 All Users / ទាំងអស់"),
+        KeyboardButton("📊 Export Users"),
+        KeyboardButton("🔙 Admin Menu"),
+    )
+    bot.send_message(message.chat.id, (
+        f"{_box('👥 USER MANAGEMENT', 'គ្រប់គ្រងអ្នកប្រើ')}\n\n"
+        "🔽 Select option / ជ្រើសរើស:"
+    ), reply_markup=markup, parse_mode="HTML")
+
+
+@bot.message_handler(func=lambda m: m.text == "💰 Balance / សមតុល្យ")
+def admin_balance_ctl(message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    markup = ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
+    markup.add(
+        KeyboardButton("➕ Add Balance / បន្ថែម"),
+        KeyboardButton("➖ Remove Balance / ដក"),
+        KeyboardButton("💾 Export Balances"),
+        KeyboardButton("🔙 Admin Menu"),
+    )
+    bot.send_message(message.chat.id, (
+        f"{_box('💰 BALANCE CONTROL', 'គ្រប់គ្រងសមតុល្យ')}\n\n"
+        "🔽 Select option / ជ្រើសរើស:"
+    ), reply_markup=markup, parse_mode="HTML")
+
+
+@bot.message_handler(func=lambda m: m.text == "🏪 Reseller")
+def admin_reseller_ctl(message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    markup = ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
+    markup.add(
+        KeyboardButton("➕ Add Reseller / បន្ថែម"),
+        KeyboardButton("➖ Remove Reseller / ដក"),
+        KeyboardButton("📋 List Resellers"),
+        KeyboardButton("🔙 Admin Menu"),
+    )
+    bot.send_message(message.chat.id, (
+        f"{_box('🏪 RESELLER CONTROL', 'គ្រប់គ្រង Reseller')}\n\n"
+        "🔽 Select option / ជ្រើសរើស:"
+    ), reply_markup=markup, parse_mode="HTML")
+
+
+@bot.message_handler(func=lambda m: m.text == "💵 Prices / តម្លៃ")
+def admin_price_ctl(message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    markup = ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
+    for code, g in GAME_MAP.items():
+        markup.add(KeyboardButton(f"📋 {g['emoji']} {g['name']} Prices"))
+    markup.add(
+        KeyboardButton("➕ Add Product / បន្ថែម"),
+        KeyboardButton("📦 Add Package / កញ្ចប់"),
+        KeyboardButton("🗑️ Delete Product"),
+        KeyboardButton("🔙 Admin Menu"),
+    )
+    bot.send_message(message.chat.id, (
+        f"{_box('💵 PRICE CONTROL', 'គ្រប់គ្រងតម្លៃ')}\n\n"
+        "🔽 Select game / ជ្រើសរើសហ្គេម:"
+    ), reply_markup=markup, parse_mode="HTML")
+
+
+@bot.message_handler(func=lambda m: m.text == "📊 Stats / ស្ថិតិ")
+def admin_stats(message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    conn = _db_conn()
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM balances")
+    total_users = c.fetchone()[0]
+    c.execute("SELECT COALESCE(SUM(balance), 0) FROM balances")
+    total_bal = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM balances WHERE is_reseller = 1")
+    resellers = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM balances WHERE balance > 0")
+    active = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM orders")
+    total_orders = c.fetchone()[0]
+    c.execute("SELECT COALESCE(SUM(price), 0) FROM orders")
+    total_revenue = c.fetchone()[0]
+    conn.close()
+
+    markup = ReplyKeyboardMarkup(row_width=1, resize_keyboard=True)
+    markup.add(KeyboardButton("🔙 Admin Menu"))
+    bot.send_message(message.chat.id, (
+        f"{_box('📊 BOT STATISTICS', 'ស្ថិតិ Bot')}\n\n"
+        f"👥 <b>Total Users:</b>  <code>{total_users}</code>\n"
+        f"💰 <b>Total Balance:</b>  <code>${total_bal:.2f}</code>\n"
+        f"🏪 <b>Resellers:</b>  <code>{resellers}</code>\n"
+        f"👤 <b>Normal:</b>  <code>{total_users - resellers}</code>\n"
+        f"⚡ <b>Active (bal &gt; 0):</b>  <code>{active}</code>\n\n"
+        f"{_sep()}\n"
+        f"🛒 <b>Total Orders:</b>  <code>{total_orders}</code>\n"
+        f"💵 <b>Total Revenue:</b>  <code>${total_revenue:.2f}</code>\n\n"
+        f"{_sep()}\n"
+        f"⏰ {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"
+    ), reply_markup=markup, parse_mode="HTML")
+
+
+@bot.message_handler(func=lambda m: m.text == "👤 Normal Mode")
+def admin_normal_mode(message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    nickname = _h(message.from_user.first_name or "User")
+    markup = _main_menu_markup(message.from_user.id)
+    markup.add(KeyboardButton("🔐 Admin Panel"))
+    bot.send_message(message.chat.id, (
+        f"{_box('🛒 USER MODE')}\n\n"
+        f"👋 <b>{nickname}</b>, switched to normal view\n"
+        "🔐 Press <b>Admin Panel</b> to return"
+    ), reply_markup=markup, parse_mode="HTML")
+
+
+@bot.message_handler(func=lambda m: m.text == "🔐 Admin Panel")
+def admin_panel_btn(message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    send_welcome(message)
+
+
+@bot.message_handler(func=lambda m: m.text == "🔙 Admin Menu")
+def back_admin(message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    send_welcome(message)
+
+
+# ── Admin Quick Actions ──
+
+@bot.message_handler(func=lambda m: m.text == "➕ Add Balance / បន្ថែម")
+def qa_add_bal(message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    bot.send_message(message.chat.id, (
+        f"💰 <b>Add Balance / បន្ថែមសមតុល្យ</b>\n\n"
+        "📋 <code>/addb &lt;user_id&gt; &lt;amount&gt;</code>\n"
+        "📌 Ex: <code>/addb 123456789 10.50</code>"
+    ), parse_mode="HTML")
+
+
+@bot.message_handler(func=lambda m: m.text == "➖ Remove Balance / ដក")
+def qa_rm_bal(message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    bot.send_message(message.chat.id, (
+        f"💸 <b>Remove Balance / ដកសមតុល្យ</b>\n\n"
+        "📋 <code>/removeb &lt;user_id&gt; &lt;amount&gt;</code>\n"
+        "📌 Ex: <code>/removeb 123456789 5.00</code>"
+    ), parse_mode="HTML")
+
+
+@bot.message_handler(func=lambda m: m.text == "💾 Export Balances")
+def qa_export_bal(message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    allbal_handler(message)
+
+
+@bot.message_handler(func=lambda m: m.text == "🔍 Find User / ស្វែងរក")
+def qa_find(message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    bot.send_message(message.chat.id, (
+        "🔍 <b>Find User / ស្វែងរក</b>\n\n"
+        "📋 <code>/finduser &lt;search&gt;</code>\n"
+        "📌 Ex: <code>/finduser john</code>"
+    ), parse_mode="HTML")
+
+
+@bot.message_handler(func=lambda m: m.text == "👁️ View User / មើល")
+def qa_view(message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    bot.send_message(message.chat.id, (
+        "👁️ <b>View User / មើល</b>\n\n"
+        "📋 <code>/checkuser &lt;user_id&gt;</code>\n"
+        "📌 Ex: <code>/checkuser 123456789</code>"
+    ), parse_mode="HTML")
+
+
+@bot.message_handler(func=lambda m: m.text in ("📋 All Users / ទាំងអស់", "📊 Export Users"))
+def qa_all_users(message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    allusers_handler(message)
+
+
+@bot.message_handler(func=lambda m: m.text == "➕ Add Reseller / បន្ថែម")
+def qa_add_re(message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    bot.send_message(message.chat.id, (
+        "🏪 <b>Add Reseller</b>\n\n"
+        "📋 <code>/addre &lt;user_id&gt;</code>\n"
+        "📌 Ex: <code>/addre 123456789</code>"
+    ), parse_mode="HTML")
+
+
+@bot.message_handler(func=lambda m: m.text == "➖ Remove Reseller / ដក")
+def qa_rm_re(message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    bot.send_message(message.chat.id, (
+        "🏪 <b>Remove Reseller</b>\n\n"
+        "📋 <code>/delre &lt;user_id&gt;</code>\n"
+        "📌 Ex: <code>/delre 123456789</code>"
+    ), parse_mode="HTML")
+
+
+@bot.message_handler(func=lambda m: m.text == "📋 List Resellers")
+def qa_list_re(message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    conn = _db_conn()
+    c = conn.cursor()
+    c.execute("SELECT user_id, balance FROM balances WHERE is_reseller = 1 ORDER BY balance DESC")
+    results = c.fetchall()
+    conn.close()
+    if not results:
+        bot.send_message(message.chat.id, "❌ No resellers found")
+        return
+    text = f"{_box('🏪 ALL RESELLERS')}\n\n"
+    for uid, bal in results:
+        try:
+            info = bot.get_chat(uid)
+            uname = f"@{_h(info.username)}" if info.username else "N/A"
+        except Exception:
+            uname = "Private"
+        text += f"  🏪 <code>{uid}</code> │ ${bal:.2f} │ {uname}\n"
+    text += f"\n📊 Total: <b>{len(results)}</b>"
+    bot.send_message(message.chat.id, text, parse_mode="HTML")
+
+
+@bot.message_handler(func=lambda m: m.text == "➕ Add Product / បន្ថែម")
+def qa_add_product(message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    bot.send_message(message.chat.id, (
+        "➕ <b>Add Product</b>\n\n"
+        "📋 <code>/addpdr &lt;game&gt; &lt;id&gt; &lt;normal&gt; &lt;reseller&gt;</code>\n\n"
+        "🎮 Games: <code>ml</code> <code>ff</code> <code>mlph</code>\n"
+        "📌 Ex: <code>/addpdr ml 1200 15.50 14.00</code>"
+    ), parse_mode="HTML")
+
+
+@bot.message_handler(func=lambda m: m.text == "📦 Add Package / កញ្ចប់")
+def qa_add_package(message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    bot.send_message(message.chat.id, (
+        "📦 <b>Add Package</b>\n\n"
+        "📋 <code>/addpack &lt;game&gt; &lt;name&gt; &lt;items&gt; &lt;normal&gt; &lt;reseller&gt;</code>\n\n"
+        "📌 Ex: <code>/addpack ml starter 86+Weekly 2.50 2.30</code>"
+    ), parse_mode="HTML")
+
+
+def _show_admin_prices(message, game_code):
+    g = GAME_MAP[game_code]
+    price_dict = g["prices"]
+    game_name = g["name"]
+    lines = []
+    for item_id, data in price_dict.items():
+        n = data.get("normal", 0)
+        r = data.get("reseller", 0)
+        lines.append(f"  <code>{item_id:<12}</code> │ ${n:.2f} │ ${r:.2f}")
+    text = (
+        f"{_box('💵 ' + game_name.upper())}\n\n"
+        f"  <b>{'Item':<12}</b> │ <b>Normal</b> │ <b>Reseller</b>\n"
+        f"  {'─' * 35}\n"
+    )
+    text += "\n".join(lines)
+    text += f"\n\n{_sep()}\n📋 Edit: <code>/setprice {game_code} &lt;id&gt; &lt;normal&gt; &lt;reseller&gt;</code>"
+    markup = ReplyKeyboardMarkup(row_width=1, resize_keyboard=True)
+    markup.add(KeyboardButton("🔙 Admin Menu"))
+    bot.send_message(message.chat.id, text, reply_markup=markup, parse_mode="HTML")
+
+
+@bot.message_handler(func=lambda m: m.text and m.text.startswith("📋 ") and m.text.endswith(" Prices") and m.from_user.id in ADMIN_IDS)
+def view_game_prices(message):
+    label = message.text[2:].strip()  # Remove "📋 " prefix
+    for code, g in GAME_MAP.items():
+        if label == f"{g['emoji']} {g['name']} Prices":
+            _show_admin_prices(message, code)
+            return
+    bot.send_message(message.chat.id, "❌ Game not found")
+
+
+# ═══════════════════════════════════════════════════
+#  Back Button
+# ═══════════════════════════════════════════════════
+
+@bot.message_handler(func=lambda m: m.text in ("🔙 Back / ត្រឡប់", "🔙 Back"))
+def handle_back(message):
+    uid = message.from_user.id
+    user_states.pop(uid, None)
+    send_welcome(message)
+
+
+# ═══════════════════════════════════════════════════
+#  Deposit Flow (KHPay KHQR — Non-Blocking)
+# ═══════════════════════════════════════════════════
+
+@bot.message_handler(func=lambda m: m.text == "💰 Deposit / ដាក់ប្រាក់")
+def deposit_handler(message):
+    uid = message.from_user.id
+
+    if uid in active_deposits:
+        bot.send_message(uid, (
+            "⚠️ <b>Deposit already in progress / ការដាក់ប្រាក់កំពុងដំណើរការ</b>\n\n"
+            "Please wait for current deposit to complete\n"
+            "សូមរង់ចាំឱ្យការដាក់ប្រាក់បច្ចុប្បន្នបញ្ចប់"
+        ), parse_mode="HTML")
+        return
+
+    user_states[uid] = {"awaiting_deposit_amount": True}
+    bot.send_message(uid, (
+        f"{_box(_e('money') + ' DEPOSIT', 'ដាក់ប្រាក់')}\n\n"
+        "💵 <b>Enter amount in USD:</b>\n"
+        "   បញ្ចូលចំនួនជាដុល្លារ\n\n"
+        "📌 Examples: <code>0.50</code>  <code>1</code>  <code>5</code>  <code>10</code>\n"
+        "⚠️ Minimum: $0.01\n\n"
+        "Type <code>cancel</code> to cancel / វាយ <code>cancel</code> ដើម្បីបោះបង់"
+    ), parse_mode="HTML")
+    bot.register_next_step_handler(message, _get_deposit_amount)
+
+
+def _get_deposit_amount(message):
+    uid = message.from_user.id
+    text = (message.text or "").strip()
+
+    if text.lower() == "cancel" or text in ("🔙 Back / ត្រឡប់", "🔙 Back"):
+        user_states.pop(uid, None)
+        send_welcome(message)
+        return
+
+    try:
+        amount = float(text)
+        if amount < 0.01:
+            raise ValueError()
+    except ValueError:
+        user_states.pop(uid, None)
+        bot.send_message(uid, (
+            "❌ <b>Invalid amount / ចំនួនមិនត្រឹមត្រូវ</b>\n\n"
+            "Enter a number ≥ 0.01\n"
+            "សូមបញ្ចូលលេខ ≥ 0.01"
+        ), parse_mode="HTML")
+        return
+
+    user_states.pop(uid, None)
+
+    try:
+        qr_result = khpay.generate_qr(amount, note=f"Deposit-{uid}")
+        qr_data = qr_result.get("qr_string", "")
+        txn_id = qr_result.get("transaction_id", "")
+        download_qr = qr_result.get("download_qr", "")
+
+        if not txn_id:
+            raise RuntimeError("No transaction ID returned")
+
+        # Get QR image
+        qr_image_io = None
+        if download_qr:
+            try:
+                qr_resp = requests.get(download_qr, timeout=10)
+                qr_resp.raise_for_status()
+                qr_image_io = BytesIO(qr_resp.content)
+                qr_image_io.name = "khqr.png"
+            except Exception:
+                pass
+
+        if qr_image_io is None and qr_data:
+            img = qrcode.make(qr_data)
+            qr_image_io = BytesIO()
+            img.save(qr_image_io, "PNG")
+            qr_image_io.seek(0)
+            qr_image_io.name = "khqr.png"
+
+        if qr_image_io is None:
+            raise RuntimeError("No QR data returned")
+
+        caption = (
+            f"{_box('📱 SCAN TO PAY', 'ស្កេនដើម្បីបង់ប្រាក់')}\n\n"
+            f"💰 Amount: <b>${amount:.2f} USD</b>\n"
+            f"🔖 TXN: <code>{_h(txn_id)}</code>\n"
+            f"⏳ Expires in 3 min / ផុតកំណត់ 3 នាទី"
+        )
+
+        sent_qr = bot.send_photo(uid, qr_image_io, caption=caption, parse_mode="HTML")
+
+        bot.send_message(uid, (
+            f"{_e('check')} <b>Scan the QR above and pay</b>\n"
+            "   ស្កេន QR ខាងលើហើយបង់ប្រាក់\n\n"
+            "⏳ Auto-checking payment...\n"
+            "   កំពុងពិនិត្យការទូទាត់ស្វ័យប្រវត្តិ..."
+        ), parse_mode="HTML")
+
+        # Start non-blocking payment polling in background thread
+        active_deposits[uid] = True
+        t = threading.Thread(
+            target=_poll_payment,
+            args=(uid, txn_id, sent_qr.message_id, amount),
+            daemon=True,
+        )
+        t.start()
+
+    except Exception as e:
+        logging.error(f"QR generation error for {uid}: {e}")
+        bot.send_message(uid, (
+            "❌ <b>Error generating QR</b>\n\n"
+            f"Details: <code>{_h(e)}</code>\n\n"
+            "Please try again / សូមព្យាយាមម្តងទៀត"
+        ), parse_mode="HTML")
+
+
+def _poll_payment(uid, txn_id, qr_msg_id, amount):
+    """Background thread: poll KHPay every 3s for up to 3 minutes."""
+    try:
+        for _ in range(60):  # 60 × 3s = 180s = 3 min
+            time.sleep(3)
+            try:
+                result = khpay.check_payment(txn_id)
+                status = result.get("status", "pending")
+                is_paid = result.get("paid", False)
+
+                if is_paid or status == "paid":
+                    update_user_balance(uid, amount)
+                    new_bal = get_user_balance(uid)
+                    now = datetime.now().strftime("%d/%m/%Y %H:%M")
+                    try:
+                        username = bot.get_chat(uid).username or "Unknown"
+                    except Exception:
+                        username = "Unknown"
+
+                    bot.send_message(uid, (
+                        f"{_box(_e('check') + ' PAYMENT SUCCESSFUL', 'ការទូទាត់បានជោគជ័យ')}\n\n"
+                        f"💵 Amount: <b>${amount:.2f} USD</b>\n"
+                        f"💰 New Balance: <b>${new_bal:.2f}</b>\n"
+                        f"🔖 TXN: <code>{_h(txn_id)}</code>\n"
+                        f"⏰ {now}\n\n"
+                        f"{_sep()}\n"
+                        f"{_e('game')} Ready to order! Press <b>Games / ហ្គេម</b>"
+                    ), parse_mode="HTML")
+
+                    try:
+                        bot.delete_message(uid, qr_msg_id)
+                    except Exception:
+                        pass
+
+                    send_group_message(DEPOSIT_GROUP_ID, (
+                        f"{_box('💰 DEPOSIT COMPLETED')}\n\n"
+                        f"👤 User: @{_h(username)}\n"
+                        f"🆔 ID: {uid}\n"
+                        f"💵 Amount: ${amount:.2f} USD\n"
+                        f"🔖 TXN: {txn_id}\n"
+                        f"⏰ {now}\n"
+                        f"💳 Method: KHQR Auto"
+                    ))
+                    return
+
+                if status == "expired":
+                    bot.send_message(uid, (
+                        "⏰ <b>QR Expired / QR ផុតកំណត់</b>\n\n"
+                        "Press <b>💰 Deposit / ដាក់ប្រាក់</b> to try again"
+                    ), parse_mode="HTML")
+                    return
+
+            except Exception as e:
+                logging.error(f"Payment poll error {uid}: {e}")
+
+        # Timeout
+        try:
+            khpay.expire_transaction(txn_id)
+        except Exception:
+            pass
+
+        bot.send_message(uid, (
+            f"{_box('❌ PAYMENT TIMEOUT', 'ការទូទាត់ផុតកំណត់')}\n\n"
+            "⏰ Expired after 3 minutes\n"
+            "   ផុតកំណត់បន្ទាប់ពី 3 នាទី\n\n"
+            "Press <b>💰 Deposit / ដាក់ប្រាក់</b> to try again"
+        ), parse_mode="HTML")
+
+    finally:
+        active_deposits.pop(uid, None)
+
+
+# ═══════════════════════════════════════════════════
+#  Manual Deposit (Photo Receipt)
+# ═══════════════════════════════════════════════════
+
+@bot.message_handler(func=lambda m: (
+    m.text and m.text.replace(".", "", 1).isdigit()
+    and float(m.text) > 0
+    and len(m.text.split()) == 1
+    and m.from_user.id not in active_deposits
+    and user_states.get(m.from_user.id, {}).get("awaiting_deposit_amount") is not True
+))
+def manual_deposit_handler(message):
+    uid = message.from_user.id
+    amount = message.text.strip()
+    username = _h(message.from_user.username or "Unknown")
+
+    user_states[uid] = {"manual_deposit_amount": amount}
+
+    try:
+        with open("qr.jpg", "rb") as photo:
+            bot.send_photo(message.chat.id, photo, caption=(
+                f"{_box('💰 MANUAL DEPOSIT', 'ដាក់ប្រាក់ដោយដៃ')}\n\n"
+                f"💵 Amount: ${_h(amount)}\n"
+                f"⏳ Send receipt photo below\n"
+                f"   ផ្ញើរូបភាពវិក័យប័ត្រខាងក្រោម"
+            ))
+    except FileNotFoundError:
+        bot.send_message(message.chat.id, (
+            "❌ <b>QR image not found</b>\n\n"
+            "Use <b>💰 Deposit / ដាក់ប្រាក់</b> for KHQR payment"
+        ), parse_mode="HTML")
+        user_states.pop(uid, None)
+
+
+@bot.message_handler(content_types=["photo"])
+def photo_handler(message):
+    uid = message.from_user.id
+    username = _h(message.from_user.username or "Unknown")
+
+    state = user_states.get(uid, {})
+    amount_str = state.get("manual_deposit_amount")
+    if not amount_str:
+        bot.send_message(message.chat.id, (
+            "❌ <b>No deposit in progress</b>\n\n"
+            "Press <b>💰 Deposit / ដាក់ប្រាក់</b> first"
+        ), parse_mode="HTML")
+        return
+
+    amount = float(amount_str)
+    photo_id = message.photo[-1].file_id
+
+    markup = InlineKeyboardMarkup()
+    markup.add(
+        InlineKeyboardButton("❌ Reject", callback_data=f"reject_{uid}_{amount}"),
+        InlineKeyboardButton("✅ Approve", callback_data=f"approve_{uid}_{amount}"),
+    )
+
+    for admin_id in ADMIN_IDS:
+        bot.send_photo(admin_id, photo_id, caption=(
+            f"{_box('📩 DEPOSIT REQUEST')}\n\n"
+            f"👤 User: @{username}\n"
+            f"🆔 ID: {uid}\n"
+            f"💰 Amount: ${amount:.2f}\n"
+            f"⏰ {datetime.now().strftime('%d/%m/%Y %H:%M')}"
+        ), reply_markup=markup)
+
+    bot.send_message(message.chat.id, (
+        f"{_e('check')} <b>Receipt sent to admin</b>\n"
+        "   វិក័យប័ត្រត្រូវបានផ្ញើទៅ Admin\n\n"
+        "⏳ Waiting for approval / រង់ចាំការអនុម័ត"
+    ), parse_mode="HTML")
+
+    user_states.pop(uid, None)
+    send_welcome(message)
+
+
+# ═══════════════════════════════════════════════════
+#  Callback Handler (Admin Approve/Reject)
+# ═══════════════════════════════════════════════════
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("approve_") or call.data.startswith("reject_"))
+def callback_handler(call):
+    try:
+        parts = call.data.split("_")
+        if len(parts) < 3:
+            bot.answer_callback_query(call.id, "❌ Invalid")
+            return
+        action = parts[0]
+        target_uid = int(parts[1])
+        amount = float(parts[2])
+    except (ValueError, IndexError):
+        bot.answer_callback_query(call.id, "❌ Invalid data")
+        return
+
+    if action == "reject":
+        bot.answer_callback_query(call.id, "❌ Rejected")
+        bot.send_message(target_uid, (
+            f"{_box('❌ DEPOSIT REJECTED', 'បដិសេធការដាក់ប្រាក់')}\n\n"
+            f"💰 Amount: <b>${amount:.2f}</b>\n\n"
+            "Please try again or contact support\n"
+            "សូមព្យាយាមម្តងទៀត"
+        ), parse_mode="HTML")
+
+    elif action == "approve":
+        bot.answer_callback_query(call.id, "✅ Approved")
+        update_user_balance(target_uid, amount)
+        new_bal = get_user_balance(target_uid)
+
+        bot.send_message(target_uid, (
+            f"{_box(_e('check') + ' DEPOSIT APPROVED', 'អនុម័តការដាក់ប្រាក់')}\n\n"
+            f"💵 Amount: <b>${amount:.2f} USD</b>\n"
+            f"💰 New Balance: <b>${new_bal:.2f}</b>\n\n"
+            f"🎉 Thank you! / អរគុណ!\n"
+            f"{_e('game')} Ready to order!"
+        ), parse_mode="HTML")
+
+        try:
+            username = bot.get_chat(target_uid).username or "Unknown"
+        except Exception:
+            username = "Unknown"
+
+        now = datetime.now().strftime("%d/%m/%Y %H:%M")
+        send_group_message(DEPOSIT_GROUP_ID, (
+            f"{_box('💰 DEPOSIT APPROVED')}\n\n"
+            f"👤 User: @{_h(username)}\n"
+            f"🆔 ID: {target_uid}\n"
+            f"💵 Amount: ${amount:.2f} USD\n"
+            f"⏰ {now}\n"
+            f"💳 Method: Manual"
+        ))
+
+    try:
+        bot.delete_message(call.message.chat.id, call.message.message_id)
+    except Exception:
+        pass
+
+
+# ═══════════════════════════════════════════════════
+#  Purchase Handler (3-word order: PlayerID ServerID Item)
+# ═══════════════════════════════════════════════════
+
+@bot.message_handler(func=lambda m: m.text and len(m.text.split()) == 3 and not m.text.startswith("/"))
+def buy_item_handler(message):
+    try:
+        uid = message.from_user.id
+        args = message.text.split()
+
+        try:
+            player_id = int(args[0])
+            zone_id = int(args[1])
+            item_id = args[2]
+        except ValueError:
+            bot.send_message(message.chat.id, (
+                "❌ <b>Invalid format / ទម្រង់មិនត្រឹមត្រូវ</b>\n\n"
+                "Use: <code>PlayerID ServerID Item</code>\n"
+                "ID must be numbers / ID ត្រូវតែជាលេខ"
+            ), parse_mode="HTML")
+            return
+
+        # Determine game and price list
+        game_code = user_states.get(uid, {}).get("selected_game")
+        if not game_code:
+            # Fallback heuristic: zone_id==0 → ff, else ml
+            game_code = "ff" if zone_id == 0 else "ml"
+        if game_code not in GAME_MAP:
+            bot.send_message(message.chat.id, "❌ <b>No game selected.</b> Pick a game first.", parse_mode="HTML")
+            return
+        game_info = GAME_MAP[game_code]
+        price_list = game_info["prices"]
+        game_name = game_info["name"]
+
+        if item_id not in price_list:
+            bot.send_message(message.chat.id, (
+                f"❌ <b>Item <code>{_h(item_id)}</code> not found</b>\n\n"
+                "Check the product list and try again\n"
+                "សូមពិនិត្យបញ្ជីផលិតផល"
+            ), parse_mode="HTML")
+            return
+
+        price_key = "reseller" if is_reseller(uid) else "normal"
+        price = price_list[item_id][price_key]
+
+        if price <= 0:
+            bot.send_message(message.chat.id, "❌ This item is currently unavailable / មិនអាចប្រើបានបច្ចុប្បន្ន")
+            return
+
+        balance = get_user_balance(uid)
+
+        if balance < price:
+            bot.send_message(message.chat.id, (
+                f"{_box('❌ INSUFFICIENT BALANCE', 'សមតុល្យមិនគ្រប់គ្រាន់')}\n\n"
+                f"💰 Balance: <code>${balance:.2f}</code>\n"
+                f"💵 Price: <code>${price:.2f}</code>\n"
+                f"❌ Need: <code>${price - balance:.2f}</code> more\n\n"
+                "Deposit first / សូមដាក់ប្រាក់ជាមុន"
+            ), parse_mode="HTML")
+            return
+
+        # ── Validate Player ID ──
+        bot.send_message(message.chat.id, "🔍 <b>Checking ID...</b> / កំពុងពិនិត្យ ID...", parse_mode="HTML")
+
+        if game_code == "ff":
+            nickname = _check_ff_id(player_id)
+            if nickname is None:
+                bot.send_message(message.chat.id, (
+                    "❌ <b>Wrong Free Fire ID / ID ខុស</b>\n\n"
+                    "Player not found. Check your ID\n"
+                    "រកមិនឃើញអ្នកលេង។ សូមពិនិត្យ ID"
+                ), parse_mode="HTML")
+                return
+        elif game_code in ("ml", "mlph"):
+            nickname = _check_mlbb_id(player_id, zone_id)
+            if nickname is None:
+                bot.send_message(message.chat.id, (
+                    "❌ <b>Wrong MLBB ID / ID ខុស</b>\n\n"
+                    "Player not found. Check your ID &amp; Server\n"
+                    "រកមិនឃើញអ្នកលេង។ សូមពិនិត្យ ID"
+                ), parse_mode="HTML")
+                return
+        else:
+            # Custom game — skip ID validation
+            nickname = "Player"
+
+        # ── Confirm order with inline button ──
+        confirm_markup = InlineKeyboardMarkup()
+        confirm_markup.add(
+            InlineKeyboardButton("❌ Cancel", callback_data=f"ordercancel_{uid}_0"),
+            InlineKeyboardButton("✅ Confirm", callback_data=f"orderconfirm_{uid}_{player_id}_{zone_id}_{item_id}_{game_code}"),
+        )
+
+        bot.send_message(message.chat.id, (
+            f"{_box(_e('shop') + ' CONFIRM ORDER', 'បញ្ជាក់ការបញ្ជាទិញ')}\n\n"
+            f"🎮 <b>Game:</b> {_h(game_name)}\n"
+            f"👤 <b>Player:</b> <code>{player_id}</code>\n"
+            f"🌐 <b>Server:</b> <code>{zone_id}</code>\n"
+            f"📝 <b>Nickname:</b> {_h(nickname)}\n"
+            f"💎 <b>Item:</b> <code>{_h(item_id)}</code>\n"
+            f"💰 <b>Price:</b> <code>${price:.2f}</code>\n"
+            f"💳 <b>Balance:</b> <code>${balance:.2f}</code>\n\n"
+            f"{_sep()}\n"
+            f"Press {_e('check')} to confirm / ចុច ✅ ដើម្បីបញ្ជាក់"
+        ), reply_markup=confirm_markup, parse_mode="HTML")
+
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ Error: {_h(e)}")
+        logging.error(f"Error in buy_item_handler: {e}")
+
+
+# ═══════════════════════════════════════════════════
+#  Order Confirmation Callback
+# ═══════════════════════════════════════════════════
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("orderconfirm_"))
+def order_confirm_callback(call):
+    try:
+        parts = call.data.split("_")
+        uid = int(parts[1])
+        player_id = int(parts[2])
+        zone_id = int(parts[3])
+        item_id = parts[4]
+        game_code = parts[5] if len(parts) > 5 else ("ff" if zone_id == 0 else "ml")
+
+        if call.from_user.id != uid:
+            bot.answer_callback_query(call.id, "❌ Not your order")
+            return
+
+        # Re-validate
+        if game_code not in GAME_MAP:
+            bot.answer_callback_query(call.id, "❌ Game no longer available")
+            return
+        game_info = GAME_MAP[game_code]
+        price_list = game_info["prices"]
+        game_name = game_info["name"]
+
+        if item_id not in price_list:
+            bot.answer_callback_query(call.id, "❌ Item no longer available")
+            return
+
+        price_key = "reseller" if is_reseller(uid) else "normal"
+        price = price_list[item_id][price_key]
+        balance = get_user_balance(uid)
+
+        if balance < price:
+            bot.answer_callback_query(call.id, "❌ Insufficient balance")
+            return
+
+        # Re-check nickname
+        if game_code == "ff":
+            nickname = _check_ff_id(player_id)
+        elif game_code in ("ml", "mlph"):
+            nickname = _check_mlbb_id(player_id, zone_id)
+        else:
+            nickname = "Player"
+        nickname = nickname or "Unknown"
+
+        # Deduct & save
+        update_user_balance(uid, -price)
+        new_bal = get_user_balance(uid)
+        save_order(uid, game_name, player_id, zone_id, nickname, item_id, price)
+        now = datetime.now().strftime("%d/%m/%Y %H:%M")
+
+        bot.answer_callback_query(call.id, "✅ Order placed!")
+
+        # Edit confirmation message
+        try:
+            bot.edit_message_text(
+                (
+                    f"{_box(_e('check') + ' ORDER SUCCESS', 'បញ្ជាទិញបានជោគជ័យ')}\n\n"
+                    f"🎮 <b>Game:</b> {_h(game_name)}\n"
+                    f"👤 <b>Player:</b> <code>{player_id}</code>\n"
+                    f"🌐 <b>Server:</b> <code>{zone_id}</code>\n"
+                    f"📝 <b>Nickname:</b> {_h(nickname)}\n"
+                    f"💎 <b>Item:</b> <code>{_h(item_id)}</code>\n"
+                    f"💰 <b>Price:</b> <code>${price:.2f}</code>\n"
+                    f"💳 <b>Remaining:</b> <code>${new_bal:.2f}</code>\n\n"
+                    f"{_sep()}\n"
+                    f"⏰ {now}\n"
+                    f"⏳ Processing... {_e('check')}"
+                ),
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+        # Send to game group
+        purchase_details = f"{player_id} {zone_id} {item_id}"
+        if game_code == "ff":
+            send_group_message(GROUP_FF_ID, purchase_details)
+        else:
+            send_group_message(GROUP_MLBB_ID, purchase_details)
+
+        # Send to operations
+        try:
+            username = call.from_user.username or "Unknown"
+        except Exception:
+            username = "Unknown"
+
+        send_group_message(GROUP_OPERATIONS_ID, (
+            f"{_box('🛒 NEW ORDER')}\n\n"
+            f"👤 Buyer: @{_h(username)} ({uid})\n"
+            f"🎮 Game: {_h(game_name)}\n"
+            f"🆔 Player: {player_id} | Server: {zone_id}\n"
+            f"📝 Nickname: {_h(nickname)}\n"
+            f"💎 Item: {_h(item_id)}\n"
+            f"💰 Price: ${price:.2f}\n"
+            f"⏰ {now}"
+        ))
+
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"❌ Error: {e}")
+        logging.error(f"Order confirm error: {e}")
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("ordercancel_"))
+def order_cancel_callback(call):
+    try:
+        uid = int(call.data.split("_")[1])
+        if call.from_user.id != uid:
+            bot.answer_callback_query(call.id, "❌ Not your order")
+            return
+        bot.answer_callback_query(call.id, "❌ Order cancelled")
+        try:
+            bot.edit_message_text(
+                "❌ <b>Order cancelled / បោះបង់ការបញ្ជាទិញ</b>",
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+    except Exception:
+        bot.answer_callback_query(call.id, "❌ Error")
+
+
+# ═══════════════════════════════════════════════════
+#  Admin Game Management
+# ═══════════════════════════════════════════════════
+
+@bot.message_handler(func=lambda m: m.text == "🎮 Games Mgmt / ហ្គេម")
+def admin_games_mgmt(message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    markup = ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
+    markup.add(
+        KeyboardButton("➕ Add Game / បន្ថែមហ្គេម"),
+        KeyboardButton("🗑️ Delete Game / លុបហ្គេម"),
+        KeyboardButton("📋 List Games / បញ្ជីហ្គេម"),
+        KeyboardButton("🔙 Admin Menu"),
+    )
+    bot.send_message(message.chat.id, (
+        f"{_box('🎮 GAMES MANAGEMENT', 'គ្រប់គ្រងហ្គេម')}\n\n"
+        "🔽 Select option / ជ្រើសរើស:"
+    ), reply_markup=markup, parse_mode="HTML")
+
+
+@bot.message_handler(func=lambda m: m.text == "📋 List Games / បញ្ជីហ្គេម")
+def list_games_handler(message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    lines = []
+    for code, g in GAME_MAP.items():
+        count = len(g["prices"])
+        lines.append(f"  {g['emoji']} <b>{_h(g['name'])}</b>  ─  <code>{code}</code>  ({count} items)")
+    bot.send_message(message.chat.id, (
+        f"{_box('📋 ALL GAMES')}\n\n" + "\n".join(lines)
+    ), parse_mode="HTML")
+
+
+@bot.message_handler(func=lambda m: m.text == "➕ Add Game / បន្ថែមហ្គេម")
+def add_game_hint(message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    bot.send_message(message.chat.id, (
+        f"{_box('➕ ADD GAME')}\n\n"
+        "📋 <code>/addgame &lt;code&gt; &lt;emoji&gt; &lt;Display Name&gt;</code>\n\n"
+        "📌 Ex: <code>/addgame pubg 🔫 PUBG Mobile</code>\n"
+        "📌 Ex: <code>/addgame genshin ⚔️ Genshin Impact</code>\n\n"
+        "Code must be lowercase, no spaces"
+    ), parse_mode="HTML")
+
+
+@bot.message_handler(func=lambda m: m.text == "🗑️ Delete Game / លុបហ្គេម")
+def del_game_hint(message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    codes = ", ".join(f"<code>{c}</code>" for c in GAME_MAP)
+    bot.send_message(message.chat.id, (
+        f"{_box('🗑️ DELETE GAME')}\n\n"
+        f"📋 <code>/delgame &lt;code&gt;</code>\n\n"
+        f"🎮 Current games: {codes}\n\n"
+        "⚠️ This will remove the game and all its products!"
+    ), parse_mode="HTML")
+
+
+@bot.message_handler(commands=["addgame"])
+def addgame_handler(message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    try:
+        args = message.text.split(maxsplit=3)
+        if len(args) < 4:
+            bot.reply_to(message, (
+                f"{_box('➕ ADD GAME')}\n\n"
+                "📋 <code>/addgame &lt;code&gt; &lt;emoji&gt; &lt;Display Name&gt;</code>\n\n"
+                "📌 Ex: <code>/addgame pubg 🔫 PUBG Mobile</code>"
+            ), parse_mode="HTML")
+            return
+        code = args[1].lower().strip()
+        emoji = args[2].strip()
+        name = args[3].strip()
+        if not code.isalnum():
+            bot.reply_to(message, "❌ Code must be alphanumeric (no spaces/symbols)")
+            return
+        if code in GAME_MAP:
+            bot.reply_to(message, f"❌ Game <code>{_h(code)}</code> already exists!", parse_mode="HTML")
+            return
+        GAME_MAP[code] = {"name": name, "emoji": emoji, "prices": {}}
+        bot.reply_to(message, (
+            f"{_box('✅ GAME ADDED')}\n\n"
+            f"{emoji} <b>{_h(name)}</b>\n"
+            f"🔤 Code: <code>{_h(code)}</code>\n"
+            f"📦 Products: 0\n\n"
+            f"Add products: <code>/addpdr {_h(code)} &lt;id&gt; &lt;normal&gt; &lt;reseller&gt;</code>"
+        ), parse_mode="HTML")
+    except Exception:
+        bot.reply_to(message, "❌ Invalid input")
+
+
+@bot.message_handler(commands=["delgame"])
+def delgame_handler(message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    try:
+        args = message.text.split()
+        if len(args) != 2:
+            codes = ", ".join(f"<code>{c}</code>" for c in GAME_MAP)
+            bot.reply_to(message, (
+                f"{_box('🗑️ DELETE GAME')}\n\n"
+                f"📋 <code>/delgame &lt;code&gt;</code>\n\n"
+                f"🎮 Games: {codes}"
+            ), parse_mode="HTML")
+            return
+        code = args[1].lower().strip()
+        if code not in GAME_MAP:
+            bot.reply_to(message, f"❌ Game <code>{_h(code)}</code> not found", parse_mode="HTML")
+            return
+        removed = GAME_MAP.pop(code)
+        bot.reply_to(message, (
+            f"{_box('🗑️ GAME DELETED')}\n\n"
+            f"{removed['emoji']} <b>{_h(removed['name'])}</b>\n"
+            f"🔤 Code: <code>{_h(code)}</code>\n"
+            f"📦 {len(removed['prices'])} products removed"
+        ), parse_mode="HTML")
+    except Exception:
+        bot.reply_to(message, "❌ Invalid input")
+
+
+@bot.message_handler(commands=["delpdr"])
+def delpdr_handler(message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    try:
+        args = message.text.split()
+        if len(args) != 3:
+            codes = ", ".join(f"<code>{c}</code>" for c in GAME_MAP)
+            bot.reply_to(message, (
+                f"{_box('🗑️ DELETE PRODUCT')}\n\n"
+                f"📋 <code>/delpdr &lt;game&gt; &lt;item_id&gt;</code>\n\n"
+                f"🎮 Games: {codes}\n"
+                f"📌 Ex: <code>/delpdr ml Weekly</code>"
+            ), parse_mode="HTML")
+            return
+        game = args[1].lower().strip()
+        item_id = args[2]
+        if game not in GAME_MAP:
+            codes = ", ".join(f"<code>{c}</code>" for c in GAME_MAP)
+            bot.reply_to(message, f"❌ Invalid game. Use: {codes}", parse_mode="HTML")
+            return
+        price_dict = GAME_MAP[game]["prices"]
+        if item_id not in price_dict:
+            items = ", ".join(f"<code>{k}</code>" for k in price_dict)
+            bot.reply_to(message, (
+                f"❌ Item <code>{_h(item_id)}</code> not found\n\n"
+                f"📦 Available: {items}"
+            ), parse_mode="HTML")
+            return
+        removed = price_dict.pop(item_id)
+        bot.reply_to(message, (
+            f"{_box('🗑️ PRODUCT DELETED')}\n\n"
+            f"🎮 Game: <b>{_h(GAME_MAP[game]['name'])}</b>\n"
+            f"🆔 Item: <code>{_h(item_id)}</code>\n"
+            f"👤 Was: ${removed['normal']:.2f} / ${removed['reseller']:.2f}"
+        ), parse_mode="HTML")
+    except Exception:
+        bot.reply_to(message, "❌ Invalid input")
+
+
+@bot.message_handler(func=lambda m: m.text == "🗑️ Delete Product")
+def delete_product_hint(message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    codes = ", ".join(f"<code>{c}</code>" for c in GAME_MAP)
+    bot.send_message(message.chat.id, (
+        f"{_box('🗑️ DELETE PRODUCT')}\n\n"
+        f"📋 <code>/delpdr &lt;game&gt; &lt;item_id&gt;</code>\n\n"
+        f"🎮 Games: {codes}\n"
+        f"📌 Ex: <code>/delpdr ml Weekly</code>"
+    ), parse_mode="HTML")
+
+
+# ═══════════════════════════════════════════════════
+#  Start Bot
+# ═══════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    logging.info("Bot is running...")
+    bot.remove_webhook()
+    bot.infinity_polling()
